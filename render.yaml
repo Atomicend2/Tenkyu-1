@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: tenku
+    env: node
+    region: oregon
+    plan: free
+    buildCommand: pnpm install --frozen-lockfile=false && pnpm --filter @workspace/api-server run build
+    startCommand: pnpm --filter @workspace/api-server run start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: BOT_PHONE_NUMBER
+        sync: false
+      - key: OWNER_NUMBERS
+        sync: false
+      - key: BOT_OWNER_LID
+        sync: false
+      - key: WEBSITE_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: DATA_DIR
+        value: /data
+    disk:
+      name: tenku-data
+      mountPath: /data
+      sizeGB: 1
