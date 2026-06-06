@@ -72,6 +72,7 @@ onlyBuiltDependencies:
   - '@swc/core'
   - '@firebase/util'
   - '@whiskeysockets/baileys'
+  - baileys
   - better-sqlite3
   - esbuild
   - msw
@@ -167,6 +168,7 @@ overrides:
 allowBuilds:
   '@firebase/util': true
   '@whiskeysockets/baileys': true
+  baileys: true
   better-sqlite3: true
   esbuild: true
   protobufjs: true
