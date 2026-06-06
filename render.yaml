@@ -4,8 +4,9 @@ services:
     env: node
     region: oregon
     plan: free
-    buildCommand: pnpm install --frozen-lockfile=false && pnpm --filter @workspace/api-server run build
-    startCommand: pnpm --filter @workspace/api-server run start
+    buildCommand: pnpm install --frozen-lockfile=false && pnpm --filter @workspace/shadow-garden run build && node artifacts/api-server/build.mjs
+    startCommand: node --enable-source-maps artifacts/api-server/dist/index.mjs
+    healthCheckPath: /healthz
     envVars:
       - key: NODE_ENV
         value: production

@@ -187,7 +187,7 @@ export async function handleMessage(
 
   // Allow DMs only for core user commands (.reg, .p, .bal, etc.)
   if (!isGroup && !isOwner && !getStaff(sender)) {
-    const allowedDmCmds = new Set(["register","reg","profile","p","balance","bal","daily","help","info","ping","alive","test","community","website","mem","comp","botreply"]);
+    const allowedDmCmds = new Set(["register","reg","profile","p","balance","bal","daily","help","info","ping","alive","test","community","website","mem","comp"]);
     if (!isCommandBody) return;
     const [rawDmCmd] = trimmedBody.slice(PREFIX.length).trim().split(/\s+/);
     if (!allowedDmCmds.has(rawDmCmd?.toLowerCase())) return;

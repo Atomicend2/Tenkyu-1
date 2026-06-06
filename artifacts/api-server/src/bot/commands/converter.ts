@@ -184,13 +184,6 @@ export async function handleConverter(ctx: CommandContext): Promise<void> {
     return;
   }
 
-  if (cmd === "speech") {
-    const text = args.join(" ");
-    if (!text) { await sendText(from, "❌ Usage: .speech <text> (reply to image/sticker)"); return; }
-    await sendText(from, `🗣️ Speech overlay: "${text}" — Image editing feature coming soon!`);
-    return;
-  }
-
   if (cmd === "mood") {
     const tag = args[0];
     if (!tag) { await sendText(from, "❌ Usage: .mood <tag>"); return; }
