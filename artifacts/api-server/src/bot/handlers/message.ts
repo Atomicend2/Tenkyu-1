@@ -339,7 +339,7 @@ export async function handleMessage(
   const ctx: CommandContext = {
     sock: replySock, msg: normalizedMsg, from, sender, command, args, isAdmin, isBotAdmin,
     isOwner, isGroupAdmin, groupMeta, prefix: PREFIX, body: trimmedBody,
-    resolvedMentions,
+    resolvedMentions, lidFallbackPhone,
   };
 
   try {
@@ -427,7 +427,10 @@ async function dispatch(ctx: CommandContext): Promise<void> {
   const { command, from, sender, msg } = ctx;
 
   if (!UNREG_ALLOWED_CMDS.has(command)) {
-    const senderUser = getUser(sender);
+    // getUser() extracts the phone from the JID. If group metadata resolution
+    // failed and sender is still an @lid JID, the extracted digits are the LID,
+    // not the phone — so look up by LID as a fallback before giving up.
+    const senderUser = getUser(sender) ?? (ctx.lidFallbackPhone ? getUser(ctx.lidFallbackPhone) : null);
     if (!senderUser?.registered) {
       await sendText(
         from,
@@ -618,7 +621,7 @@ async function dispatch(ctx: CommandContext): Promise<void> {
           db.prepare(
             "UPDATE users SET id = ?, phone = ?, whatsapp_id = ?, lid = COALESCE(lid, ?), registered = 1, registered_at = COALESCE(NULLIF(registered_at,0), ?) WHERE id = ?"
           ).run(phone, phone, senderPhone, lidNum, nowSec, userRow.id);
-          for (const t of ["rpg_characters", "inventory", "user_cards", "message_counts", "card_deck", "deck_backgrounds", "guild_members", "warnings", "muted_users", "summer_tokens", "afk_users"]) {
+          for (const t of ["rpg_characters","inventory","user_cards","message_counts","card_deck","deck_backgrounds","guild_members","warnings","muted_users","summer_tokens","afk_users","lottery_entries"]) {
             try { db.prepare(`UPDATE OR IGNORE ${t} SET user_id = ? WHERE user_id = ?`).run(phone, userRow.id); } catch {}
           }
         })();
@@ -633,10 +636,11 @@ async function dispatch(ctx: CommandContext): Promise<void> {
           const ghostRow = db.prepare("SELECT * FROM users WHERE id = ?").get(senderPhone) as any;
           if (ghostRow && !ghostRow.registered) {
             db.transaction(() => {
-              db.prepare("DELETE FROM users WHERE id = ?").run(senderPhone);
-              for (const t of ["rpg_characters", "inventory", "user_cards", "message_counts", "card_deck", "deck_backgrounds", "guild_members", "warnings", "muted_users", "summer_tokens", "afk_users"]) {
+              // Migrate child records BEFORE deleting the ghost row
+              for (const t of ["rpg_characters","inventory","user_cards","message_counts","card_deck","deck_backgrounds","guild_members","warnings","muted_users","summer_tokens","afk_users","lottery_entries"]) {
                 try { db.prepare(`UPDATE OR IGNORE ${t} SET user_id = ? WHERE user_id = ?`).run(phone, senderPhone); } catch {}
               }
+              db.prepare("DELETE FROM users WHERE id = ?").run(senderPhone);
             })();
           }
         }

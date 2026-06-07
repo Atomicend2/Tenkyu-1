@@ -21,4 +21,10 @@ export interface CommandContext {
    * in every command so @lid mentions work correctly.
    */
   resolvedMentions: string[];
+  /**
+   * When group metadata lookup fails and sender is still an @lid JID, this
+   * holds the real phone-keyed user id resolved from the DB. Empty string if
+   * not applicable. Used by dispatch() to avoid false "not registered" errors.
+   */
+  lidFallbackPhone: string;
 }
