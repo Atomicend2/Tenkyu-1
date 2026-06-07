@@ -293,6 +293,7 @@ router.post("/fetch-shoob", requireAuth, async (req: AuthRequest, res) => {
     const tier = ((req.body?.tier || "T3") as string).toUpperCase().trim();
     const series = ((req.body?.series || "Shoob") as string).trim();
     const limit = Math.min(parseInt(req.body?.limit || "20", 10) || 20, 50);
+    const page = Math.max(1, parseInt(req.body?.page || "1", 10) || 1);
 
     if (!VALID_TIERS.includes(tier)) {
       res.status(400).json({ success: false, message: `Invalid tier. Valid: ${VALID_TIERS.join(", ")}` });
@@ -303,7 +304,7 @@ router.post("/fetch-shoob", requireAuth, async (req: AuthRequest, res) => {
     const isAnimated = ANIMATED_TIERS.has(tier);
 
     // Fetch Shoob.gg card list
-    const shoobRes = await fetch("https://shoob.gg/api/cards?limit=100&page=1", {
+    const shoobRes = await fetch(`https://shoob.gg/api/cards?limit=100&page=${page}`, {
       headers: { "User-Agent": "Mozilla/5.0 (compatible; TenkuBot/1.0)" },
       signal: AbortSignal.timeout(15000),
     });

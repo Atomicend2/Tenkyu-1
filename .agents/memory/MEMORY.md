@@ -1,1 +1,2 @@
 - [Tenku stack & run config](tenku-stack.md) — pnpm monorepo; api-server builds+serves shadow-garden; single workflow on PORT=8080.
+- [Tenku registration flow](tenku-registration.md) — phone-as-source-of-truth; .reg<phone> → OTP to current chat; .verify/.link<otp> confirm; LID ghost-row conflict fix.

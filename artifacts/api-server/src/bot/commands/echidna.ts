@@ -66,7 +66,11 @@ interface EchidnaUserState {
 
 const OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
-const MODEL = "anthropic/claude-sonnet-4-5";
+const MODEL = "anthropic/claude-3.5-sonnet";
+
+if (!OPENROUTER_KEY) {
+  logger.warn("OPENROUTER_API_KEY is not set — Echidna AI responses will be unavailable until it is configured");
+}
 
 const AFFINITY_LABELS: Array<[number, string]> = [
   [20,  "Stranger"],
@@ -256,6 +260,9 @@ async function callEchidna(
   userName: string,
   userMessage: string
 ): Promise<string> {
+  if (!OPENROUTER_KEY) {
+    return "My apologies — it seems my connection to the arcane network has not yet been established. The administrator must configure my key before I can speak freely.";
+  }
   const systemPrompt = buildSystemPrompt(state, userName);
 
   // Keep last 12 turns to stay within context budget

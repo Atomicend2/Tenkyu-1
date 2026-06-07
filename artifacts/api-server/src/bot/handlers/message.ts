@@ -418,11 +418,11 @@ async function dispatch(ctx: CommandContext): Promise<void> {
         `❌ *Not registered yet.*\n\n` +
         `To use bot commands:\n\n` +
         `*Option A — Link via WhatsApp:*\n` +
-        `1. Type *.link <your phone number>*\n` +
-        `2. Enter the code sent to that number with *.verify <code>*\n\n` +
+        `1. Type *.reg <your phone number>* — e.g. *.reg 2348144550593*\n` +
+        `2. Enter the code with *.verify <code>*\n\n` +
         `*Option B — Register on the website first:*\n` +
         `${process.env["WEBSITE_URL"] || "https://tenku.onrender.com"}\n\n` +
-        `_Then type *.link* here to connect your WhatsApp._`
+        `_Then type *.reg <phone>* here to connect your WhatsApp._`
       );
       return;
     }
@@ -468,7 +468,11 @@ async function dispatch(ctx: CommandContext): Promise<void> {
     // ── .link <phone> ────────────────────────────────────────────────────────
     // Step 1 of WhatsApp account linking. The user claims a phone number;
     // the bot sends an OTP to THAT number proving ownership before linking.
+    // If arg is a 6-digit code (from .reg flow), treat it as .verify.
     case "link": {
+      if (/^\d{6}$/.test(ctx.args[0]?.trim() || "")) {
+        return dispatch({ ...ctx, command: "verify" });
+      }
       const senderPhone = sender.split("@")[0].split(":")[0];
       // Already registered — nothing to do
       const already = getUser(senderPhone);
@@ -556,6 +560,23 @@ async function dispatch(ctx: CommandContext): Promise<void> {
       db.prepare("DELETE FROM whatsapp_link_otps WHERE wa_sender = ?").run(senderPhone);
       const phone = otpRow.phone as string;
       const lidNum = senderRaw.endsWith("@lid") ? senderRaw.split("@")[0] : null;
+
+      // Before touching the LID column, resolve any ghost (unregistered) row that
+      // already owns this LID — otherwise the UNIQUE index on lid will throw.
+      if (lidNum) {
+        const lidConflict = db.prepare(
+          "SELECT id, registered FROM users WHERE lid = ? AND id != ?"
+        ).get(lidNum, phone) as any;
+        if (lidConflict && !lidConflict.registered) {
+          db.transaction(() => {
+            for (const t of ["rpg_characters", "inventory", "user_cards", "message_counts", "card_deck", "deck_backgrounds", "guild_members", "warnings", "muted_users", "summer_tokens", "afk_users"]) {
+              try { db.prepare(`UPDATE OR IGNORE ${t} SET user_id = ? WHERE user_id = ?`).run(phone, lidConflict.id); } catch {}
+            }
+            db.prepare("DELETE FROM users WHERE id = ?").run(lidConflict.id);
+          })();
+        }
+      }
+
       // Find or create the phone-keyed user record
       let userRow = db.prepare("SELECT * FROM users WHERE id = ? OR phone = ?").get(phone, phone) as any;
       if (!userRow) {
@@ -662,6 +683,40 @@ async function dispatch(ctx: CommandContext): Promise<void> {
     case "gclink":
       return handleAdmin(ctx);
 
+    // ── .reg <phone> ─────────────────────────────────────────────────────────
+    // Per registration spec: if a phone number is provided, generate an OTP and
+    // send it to the CURRENT chat so the user can confirm with .verify <code>.
+    // Without a phone arg, fall through to handleEconomy (shows instructions).
+    case "reg":
+    case "register": {
+      const rawPhone = ctx.args[0]?.replace(/\D/g, "") || "";
+      if (!rawPhone || rawPhone.length < 7 || rawPhone.length > 15) {
+        return handleEconomy(ctx);
+      }
+      const senderPhone2 = sender.split("@")[0].split(":")[0];
+      const alreadyReg = getUser(senderPhone2);
+      if (alreadyReg?.registered) {
+        await sendText(from, "✅ *Already registered!* Type *.p* to see your profile.");
+        return;
+      }
+      const regCode = String(Math.floor(100000 + Math.random() * 900000));
+      const regExpiry = Math.floor(Date.now() / 1000) + 300;
+      const { getDb: getDbReg } = await import("../db/database.js");
+      const dbReg = getDbReg();
+      dbReg.prepare(
+        "INSERT OR REPLACE INTO whatsapp_link_otps (wa_sender, phone, code, expires_at) VALUES (?, ?, ?, ?)"
+      ).run(senderPhone2, rawPhone, regCode, regExpiry);
+      await sendText(
+        from,
+        `📲 *Tenku 天空 — Link Code*\n\n` +
+        `Linking WhatsApp → account: *+${rawPhone}*\n\n` +
+        `Your code: *${regCode}*\n\n` +
+        `Type *.verify ${regCode}* to complete linking.\n\n` +
+        `_Expires in 5 minutes. Do not share._`
+      );
+      return;
+    }
+
     case "balance":
     case "bal":
     case "gems":
@@ -679,8 +734,6 @@ async function dispatch(ctx: CommandContext): Promise<void> {
     case "richlist":
     case "richlistglobal":
     case "richlg":
-    case "register":
-    case "reg":
     case "setname":
     case "profile":
     case "p":

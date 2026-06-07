@@ -964,6 +964,7 @@ function ShoobImportPanel() {
   const [tier, setTier] = useState("T3");
   const [series, setSeries] = useState("Shoob");
   const [limit, setLimit] = useState("20");
+  const [page, setPage] = useState("1");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<any>(null);
 
@@ -979,7 +980,7 @@ function ShoobImportPanel() {
           "Content-Type": "application/json",
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
-        body: JSON.stringify({ tier, series, limit: parseInt(limit, 10) || 20 }),
+        body: JSON.stringify({ tier, series, limit: parseInt(limit, 10) || 20, page: parseInt(page, 10) || 1 }),
       });
       const j = await res.json();
       setResult(j);
@@ -1006,7 +1007,7 @@ function ShoobImportPanel() {
         and import them into your card database. Images and videos are downloaded and stored locally.
       </p>
 
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-5">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-5">
         <div>
           <label className="text-xs uppercase tracking-widest text-muted-foreground mb-1.5 block">Tier</label>
           <select value={tier} onChange={(e) => setTier(e.target.value)}
@@ -1022,6 +1023,11 @@ function ShoobImportPanel() {
         <div>
           <label className="text-xs uppercase tracking-widest text-muted-foreground mb-1.5 block">Limit (max 50)</label>
           <input type="number" value={limit} onChange={(e) => setLimit(e.target.value)} min={1} max={50}
+            className="w-full px-3 py-2.5 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-sky-400/50" />
+        </div>
+        <div>
+          <label className="text-xs uppercase tracking-widest text-muted-foreground mb-1.5 block">Page</label>
+          <input type="number" value={page} onChange={(e) => setPage(e.target.value)} min={1}
             className="w-full px-3 py-2.5 bg-black/30 border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-sky-400/50" />
         </div>
       </div>
