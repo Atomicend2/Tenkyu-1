@@ -303,14 +303,45 @@ router.post("/fetch-shoob", requireAuth, async (req: AuthRequest, res) => {
     const db = getDb();
     const isAnimated = ANIMATED_TIERS.has(tier);
 
-    // Fetch Shoob.gg card list
+    // Fetch Shoob.gg card list — requires a session cookie.
+    // Set SHOOB_SESSION env var to the value of the `connect.sid` cookie from shoob.gg
+    // (log into shoob.gg in your browser → DevTools → Application → Cookies → copy connect.sid).
+    const shoobSession = process.env["SHOOB_SESSION"] || "";
+    if (!shoobSession) {
+      res.status(400).json({
+        success: false,
+        message:
+          "SHOOB_SESSION env var is not set. " +
+          "Log into shoob.gg in your browser, open DevTools → Application → Cookies, " +
+          "copy the value of the `connect.sid` cookie, then set it as SHOOB_SESSION in your environment secrets.",
+      });
+      return;
+    }
+
+    const shoobHeaders: Record<string, string> = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Accept": "application/json, text/plain, */*",
+      "Cookie": `connect.sid=${shoobSession}`,
+      "Referer": "https://shoob.gg/cards",
+    };
+
     const shoobRes = await fetch(`https://shoob.gg/api/cards?limit=100&page=${page}`, {
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; TenkuBot/1.0)" },
-      signal: AbortSignal.timeout(15000),
+      headers: shoobHeaders,
+      signal: AbortSignal.timeout(20000),
     });
 
+    if (shoobRes.status === 401 || shoobRes.status === 403) {
+      res.status(401).json({
+        success: false,
+        message:
+          "Shoob.gg session is invalid or expired. " +
+          "Log into shoob.gg again, copy your new connect.sid cookie, and update the SHOOB_SESSION secret.",
+      });
+      return;
+    }
+
     if (!shoobRes.ok) {
-      res.status(502).json({ success: false, message: `Shoob.gg API returned ${shoobRes.status}` });
+      res.status(502).json({ success: false, message: `Shoob.gg returned ${shoobRes.status} ${shoobRes.statusText}` });
       return;
     }
 
@@ -319,7 +350,7 @@ router.post("/fetch-shoob", requireAuth, async (req: AuthRequest, res) => {
     const rawCards: any[] = Array.isArray(shoobData) ? shoobData : (shoobData.cards || shoobData.data || []);
 
     if (!rawCards.length) {
-      res.status(502).json({ success: false, message: "No cards returned from Shoob.gg" });
+      res.status(502).json({ success: false, message: "No cards returned from Shoob.gg for this page — the page may be empty or beyond the last page." });
       return;
     }
 

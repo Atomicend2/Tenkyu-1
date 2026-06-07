@@ -85,11 +85,27 @@ export async function handleMessage(
             }
           })();
         } else {
-          // Both records exist — keep the phone-keyed record as the canonical one,
-          // merge the LID into it, then delete the orphan LID-keyed row.
-          // This mirrors what auth.ts does so both paths stay in sync.
-          db.prepare("UPDATE users SET lid = COALESCE(lid, ?) WHERE id = ?").run(lidNum, realPhone);
-          db.prepare("DELETE FROM users WHERE id = ?").run(lidNum);
+          // Both records exist — keep phone-keyed as canonical.
+          // Combine numeric assets (sum balance, keep higher xp/level), migrate all
+          // child table rows, then delete the lid-keyed duplicate.
+          db.transaction(() => {
+            db.prepare(`UPDATE users SET
+              lid    = COALESCE(lid, ?),
+              balance = balance + ?,
+              xp      = MAX(xp, ?),
+              level   = MAX(level, ?)
+            WHERE id = ?`).run(
+              lidNum,
+              lidRecord.balance || 0,
+              lidRecord.xp     || 0,
+              lidRecord.level  || 0,
+              realPhone,
+            );
+            for (const t of ["rpg_characters","inventory","user_cards","message_counts","card_deck","deck_backgrounds","guild_members","warnings","muted_users","summer_tokens","afk_users","lottery_entries"]) {
+              try { db.prepare(`UPDATE OR IGNORE ${t} SET user_id = ? WHERE user_id = ?`).run(realPhone, lidNum); } catch {}
+            }
+            db.prepare("DELETE FROM users WHERE id = ?").run(lidNum);
+          })();
         }
       } else {
         // No LID-keyed row yet — just store the lid on the phone-keyed row for future reference
@@ -565,11 +581,22 @@ async function dispatch(ctx: CommandContext): Promise<void> {
       // already owns this LID — otherwise the UNIQUE index on lid will throw.
       if (lidNum) {
         const lidConflict = db.prepare(
-          "SELECT id, registered FROM users WHERE lid = ? AND id != ?"
+          "SELECT id, registered, balance, xp, level FROM users WHERE lid = ? AND id != ?"
         ).get(lidNum, phone) as any;
-        if (lidConflict && !lidConflict.registered) {
+        if (lidConflict) {
+          // Merge the conflicting row (registered or not) into the canonical phone row.
           db.transaction(() => {
-            for (const t of ["rpg_characters", "inventory", "user_cards", "message_counts", "card_deck", "deck_backgrounds", "guild_members", "warnings", "muted_users", "summer_tokens", "afk_users"]) {
+            db.prepare(`UPDATE users SET
+              balance = balance + ?,
+              xp      = MAX(xp, ?),
+              level   = MAX(level, ?)
+            WHERE id = ?`).run(
+              lidConflict.balance || 0,
+              lidConflict.xp     || 0,
+              lidConflict.level  || 0,
+              phone,
+            );
+            for (const t of ["rpg_characters","inventory","user_cards","message_counts","card_deck","deck_backgrounds","guild_members","warnings","muted_users","summer_tokens","afk_users","lottery_entries"]) {
               try { db.prepare(`UPDATE OR IGNORE ${t} SET user_id = ? WHERE user_id = ?`).run(phone, lidConflict.id); } catch {}
             }
             db.prepare("DELETE FROM users WHERE id = ?").run(lidConflict.id);
@@ -706,17 +733,25 @@ async function dispatch(ctx: CommandContext): Promise<void> {
       dbReg.prepare(
         "INSERT OR REPLACE INTO whatsapp_link_otps (wa_sender, phone, code, expires_at) VALUES (?, ?, ?, ?)"
       ).run(senderPhone2, rawPhone, regCode, regExpiry);
-      await sendText(
-        from,
-        `📲 *Tenku 天空 — Link Code*\n\n` +
-        `Linking WhatsApp → account: *+${rawPhone}*\n\n` +
-        `Your code: *${regCode}*\n\n` +
-        `Type *.verify ${regCode}* to complete linking.\n\n` +
-        `_Expires in 5 minutes. Do not share._`
-      );
+      // Send OTP to sender's own DM (private chat with bot), not the current group.
+      try {
+        await ctx.sock.sendMessage(`${senderPhone2}@s.whatsapp.net`, {
+          text:
+            `*Tenku 天空 — Registration Code*\n\n` +
+            `Linking to account: *+${rawPhone}*\n\n` +
+            `Your code: *${regCode}*\n\n` +
+            `Type *.verify ${regCode}* in any chat to complete linking.\n\n` +
+            `_Expires in 5 minutes. Do not share this code._`,
+        });
+        await sendText(from, `📲 *Registration code sent to your private messages.*\n\nCheck your DM from this bot and type *.verify <code>* here to link your account.`);
+      } catch {
+        dbReg.prepare("DELETE FROM whatsapp_link_otps WHERE wa_sender = ?").run(senderPhone2);
+        await sendText(from, "❌ Couldn't send the code to your DM. Open a private chat with this bot first, then try *.reg* again.");
+      }
       return;
     }
 
+    case "frame":
     case "balance":
     case "bal":
     case "gems":
