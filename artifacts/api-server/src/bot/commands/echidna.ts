@@ -66,7 +66,7 @@ interface EchidnaUserState {
 
 const OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || "";
-const MODEL = "anthropic/claude-3.5-sonnet";
+const MODEL = "openai/gpt-4o";
 
 if (!OPENROUTER_KEY) {
   logger.warn("OPENROUTER_API_KEY is not set — Echidna AI responses will be unavailable until it is configured");
@@ -268,7 +268,11 @@ async function callEchidna(
   // Keep last 12 turns to stay within context budget
   const history = state.conversation.slice(-12);
 
+  // OpenRouter uses the OpenAI-compatible messages format.
+  // The system prompt must be the first message with role "system" —
+  // NOT a top-level "system" field (that's the Anthropic native API only).
   const messages = [
+    { role: "system" as const, content: systemPrompt },
     ...history,
     { role: "user" as const, content: userMessage },
   ];
@@ -280,7 +284,6 @@ async function callEchidna(
         model: MODEL,
         max_tokens: 400,
         messages,
-        system: systemPrompt,
       },
       {
         headers: {
@@ -295,7 +298,14 @@ async function callEchidna(
 
     return resp.data.choices?.[0]?.message?.content?.trim() || "...";
   } catch (err: any) {
-    logger.error({ err: err?.message }, "Echidna OpenRouter call failed");
+    const status = (err as any)?.response?.status;
+    logger.error({ err: err?.message, status }, "Echidna OpenRouter call failed");
+    if (status === 401 || status === 403) {
+      return "My apologies — it seems my key to the arcane network has been revoked. The administrator must update the OPENROUTER_API_KEY.";
+    }
+    if (status === 429) {
+      return "My apologies. The arcane network is momentarily overloaded. Try again in a moment.";
+    }
     return "My apologies. It seems our connection is momentarily strained. Do try again.";
   }
 }
@@ -368,21 +378,26 @@ export function shouldEchidnaRespond(params: {
   from: string;
   body: string;
   botJid: string;
+  botLid?: string;
   isReplyToBot: boolean;
   echidnaChatEnabled: boolean;
   mentionedJids: string[];
 }): boolean {
-  const { isGroup, body, botJid, isReplyToBot, echidnaChatEnabled, mentionedJids } = params;
+  const { isGroup, body, botJid, botLid, isReplyToBot, echidnaChatEnabled, mentionedJids } = params;
 
-  if (!isGroup) return true; // always respond in DMs
+  // DMs: regular users are blocked upstream by the message gate.
+  // If a DM reaches here it's an owner/staff — respond.
+  if (!isGroup) return true;
 
   const botPhone = botJid.split("@")[0].split(":")[0];
+  const botLidNum = (botLid || "").split("@")[0].split(":")[0];
+
   const isMentioned = mentionedJids.some(j => {
     const p = j.split("@")[0].split(":")[0];
-    return p === botPhone;
+    return p === botPhone || (botLidNum && p === botLidNum);
   });
 
-  // Check for name mention ("echidna")
+  // Check for name mention ("echidna") — case-insensitive whole-word match
   const nameMatch = /\bechidna\b/i.test(body);
 
   return isMentioned || nameMatch || isReplyToBot || echidnaChatEnabled;

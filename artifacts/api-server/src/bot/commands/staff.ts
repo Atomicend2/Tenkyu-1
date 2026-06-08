@@ -475,15 +475,29 @@ export async function handleStaff(ctx: CommandContext): Promise<void> {
       return;
     }
 
-    const cardId = db.prepare(
-      "INSERT INTO cards (name, series, tier, image_data, is_animated, uploaded_by) VALUES (?, ?, ?, ?, ?, ?)"
-    ).run(cardName, series, tier, imageBuffer, isAnimated, sender.split("@")[0]).lastInsertRowid;
+    // Generate a unique card ID
+    const { randomBytes } = await import("crypto");
+    const idChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let newCardId = "";
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const bytes = randomBytes(8);
+      const candidate = Array.from(bytes as Buffer).map((b: number) => idChars[b % idChars.length]).join("");
+      if (!db.prepare("SELECT 1 FROM cards WHERE id = ?").get(candidate)) {
+        newCardId = candidate;
+        break;
+      }
+    }
+    if (!newCardId) newCardId = "C" + Date.now().toString(36).toUpperCase();
+
+    db.prepare(
+      "INSERT INTO cards (id, name, series, tier, image_data, is_animated, uploaded_by) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).run(newCardId, cardName, series, tier, imageBuffer, isAnimated, sender.split("@")[0]);
 
     await sendText(from,
       `✅ Card uploaded successfully!\n\n` +
       `🎴 *${cardName}* — *${tier}*\n` +
       `📚 Series: *${series}*\n` +
-      `🆔 Card ID: *${cardId}*`
+      `🆔 Card ID: *${newCardId}*`
     );
     return;
   }
@@ -592,8 +606,8 @@ export async function handleStaff(ctx: CommandContext): Promise<void> {
 
   // ── .fetchshoob ───────────────────────────────────────────────────────────
   // Fetches cards from shoob.gg and imports them into the bot DB
-  // Usage: .fetchshoob [tier] [series] [limit]
-  // Example: .fetchshoob T3 Anime 20
+  // Usage: .fetchshoob [tier] [series] [limit] [page]
+  // Example: .fetchshoob T3 Anime 20 1
   if (cmd === "fetchshoob") {
     if (!isModOrAbove(ctx)) {
       await sendText(from, "❌ Only mods and above can import cards from Shoob.");
@@ -602,24 +616,59 @@ export async function handleStaff(ctx: CommandContext): Promise<void> {
     const tier = (args[0] || "T3").toUpperCase();
     const series = args[1] || "Shoob";
     const limit = Math.min(parseInt(args[2] || "20", 10) || 20, 50);
+    const page = Math.max(1, parseInt(args[3] || "1", 10) || 1);
     const VALID_TIERS_FETCH = ["T1","T2","T3","T4","T5","T6","TS","TX","TZ"];
     if (!VALID_TIERS_FETCH.includes(tier)) {
-      await sendText(from, `❌ Invalid tier *${tier}*.\nValid tiers: ${VALID_TIERS_FETCH.join(", ")}\n\nUsage: *.fetchshoob [tier] [series] [limit]*\nExample: *.fetchshoob T3 Anime 20*`);
+      await sendText(from, `❌ Invalid tier *${tier}*.\nValid tiers: ${VALID_TIERS_FETCH.join(", ")}\n\nUsage: *.fetchshoob [tier] [series] [limit] [page]*\nExample: *.fetchshoob T3 Anime 20 1*`);
       return;
     }
 
-    await sendText(from, `🌐 Fetching cards from Shoob.gg...\n_Tier: ${tier} | Series: ${series} | Limit: ${limit}_`);
+    await sendText(from, `🌐 Fetching cards from Shoob.gg...\n_Tier: ${tier} | Series: ${series} | Limit: ${limit} | Page: ${page}_`);
 
     try {
       const { getDb } = await import("../db/database.js");
       const db = getDb();
       const ANIMATED_FETCH = new Set(["T6","TS","TX","TZ"]);
-      const isAnimated = ANIMATED_FETCH.has(tier);
 
-      const shoobRes = await fetch("https://shoob.gg/api/cards?limit=100&page=1", {
-        headers: { "User-Agent": "Mozilla/5.0 (compatible; TenkuBot/1.0)" },
-        signal: AbortSignal.timeout(20000),
+      // ── Shoob.gg session authentication ────────────────────────────────────
+      // Requires SHOOB_SESSION env var set to the connect.sid cookie value from shoob.gg
+      const shoobSession = process.env["SHOOB_SESSION"] || "";
+      if (!shoobSession) {
+        await sendText(from,
+          `❌ *SHOOB_SESSION* not set.\n\n` +
+          `To fix:\n` +
+          `1. Log into *shoob.gg* in your browser\n` +
+          `2. Open DevTools → Application → Cookies\n` +
+          `3. Copy the *connect.sid* cookie value\n` +
+          `4. Set *SHOOB_SESSION=<value>* in your .env / Render secrets\n` +
+          `5. Restart the bot`
+        );
+        return;
+      }
+
+      const shoobHeaders: Record<string, string> = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cookie": `connect.sid=${shoobSession}`,
+        "Referer": "https://shoob.gg/cards",
+        "Origin": "https://shoob.gg",
+        "x-requested-with": "XMLHttpRequest",
+      };
+
+      // Fetch exactly what the user asked for (capped at 50 per call)
+      const shoobRes = await fetch(`https://shoob.gg/api/cards?limit=${limit}&page=${page}`, {
+        headers: shoobHeaders,
+        signal: AbortSignal.timeout(25000),
       });
+
+      if (shoobRes.status === 401 || shoobRes.status === 403) {
+        await sendText(from,
+          `❌ Shoob.gg session is *invalid or expired*.\n\n` +
+          `Log into shoob.gg again, copy your new *connect.sid* cookie, and update the *SHOOB_SESSION* secret.`
+        );
+        return;
+      }
 
       if (!shoobRes.ok) {
         await sendText(from, `❌ Shoob.gg returned HTTP ${shoobRes.status}. Try again later.`);
@@ -627,11 +676,52 @@ export async function handleStaff(ctx: CommandContext): Promise<void> {
       }
 
       const shoobData: any = await shoobRes.json();
-      const rawCards: any[] = Array.isArray(shoobData) ? shoobData : (shoobData.cards || shoobData.data || []);
+      // Shoob.gg response format: [ { id, url, description }, ... ]
+      // The `id` field is the card name/slug; `url` is the CDN image URL.
+      const rawCards: any[] = Array.isArray(shoobData)
+        ? shoobData
+        : (shoobData.cards || shoobData.data || shoobData.results || []);
 
       if (!rawCards.length) {
-        await sendText(from, "❌ No cards returned from Shoob.gg. The API may have changed.");
+        await sendText(from, `❌ No cards returned from Shoob.gg (page ${page}). The page may be empty or beyond the last page.`);
         return;
+      }
+
+      // ── CDN URL metadata parser (inline) ─────────────────────────────────
+      const folderTierMap: Record<string, string> = {
+        "1": "T1", "2": "T2", "3": "T3", "4": "T4",
+        "5": "T5", "6": "T6", "7": "TS", "8": "TX", "9": "TZ",
+      };
+      function parseShoobUrl(url: string, fallbackTier: string, fallbackSeries: string) {
+        let outTier = fallbackTier;
+        let outSeries = fallbackSeries;
+        let embeddedName: string | null = null;
+        if (!url) return { outTier, outSeries, embeddedName };
+        const folderMatch = url.match(/\/images\/cards\/(\d+)\//);
+        if (folderMatch && folderTierMap[folderMatch[1]]) outTier = folderTierMap[folderMatch[1]];
+        try {
+          const filename = decodeURIComponent((url.split("/").pop() || "")).replace(/\.[^.]+$/, "");
+          const parts = filename.split(";");
+          if (parts.length >= 3) {
+            const rawName = parts[0].replace(/_/g, " ").trim();
+            if (rawName.length >= 2 && !/^\d+$/.test(rawName) && rawName.length < 80) embeddedName = rawName;
+            const rawSeries = parts[2].split(",")[0].replace(/_/g, " ").trim();
+            if (rawSeries.length >= 2) outSeries = rawSeries;
+          }
+        } catch { /* ignore */ }
+        return { outTier, outSeries, embeddedName };
+      }
+
+      // ── ID generator (inline) ─────────────────────────────────────────────
+      const { randomBytes } = await import("crypto");
+      const idChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+      function genCardId(): string {
+        for (let attempt = 0; attempt < 50; attempt++) {
+          const bytes = randomBytes(8);
+          const candidate = Array.from(bytes as Buffer).map((b: number) => idChars[b % idChars.length]).join("");
+          if (!db.prepare("SELECT 1 FROM cards WHERE id = ?").get(candidate)) return candidate;
+        }
+        return "C" + Date.now().toString(36).toUpperCase();
       }
 
       let imported = 0;
@@ -639,22 +729,35 @@ export async function handleStaff(ctx: CommandContext): Promise<void> {
       const errors: string[] = [];
 
       for (const sc of rawCards.slice(0, limit)) {
-        const cardName: string = (sc.name || sc.title || sc.card_name || "").trim();
-        const cardSeries: string = (sc.series || sc.anime || sc.source || series).trim() || series;
-        const mediaUrl: string = sc.image || sc.imageUrl || sc.image_url || sc.video || sc.videoUrl || sc.media_url || "";
-        const isVideo = /\.(mp4|webm|mov)(\?|$)/i.test(mediaUrl);
+        // ── Field extraction ───────────────────────────────────────────────
+        // Shoob.gg uses { id (name slug), url (CDN image), description }
+        const rawCardName: string = (sc.id || sc.name || sc.title || sc.card_name || "").trim();
+        const mediaUrl: string = (sc.url || sc.image || sc.imageUrl || sc.image_url || sc.video || sc.videoUrl || sc.media_url || "").trim();
+        const cardDescription: string = (sc.description || sc.desc || "").trim();
 
-        if (!cardName || cardName.length < 2) { skipped++; continue; }
+        if (!rawCardName || rawCardName.length < 2) { skipped++; continue; }
 
-        const existing = db.prepare("SELECT id FROM cards WHERE LOWER(name) = LOWER(?)").get(cardName) as any;
+        // ── CDN metadata ────────────────────────────────────────────────────
+        const { outTier: cardTier, outSeries: cardSeries, embeddedName } = parseShoobUrl(mediaUrl, tier, series);
+        const displayName = (embeddedName && embeddedName !== rawCardName)
+          ? embeddedName
+          : rawCardName.replace(/_/g, " ");
+
+        // ── Duplicate check ─────────────────────────────────────────────────
+        const existing = db.prepare("SELECT id FROM cards WHERE LOWER(name) = LOWER(?)").get(displayName) as any;
         if (existing) { skipped++; continue; }
 
+        // ── Media download ──────────────────────────────────────────────────
+        const isVideo = /\.(mp4|webm|mov)(\?|$)/i.test(mediaUrl);
         let imageData: Buffer | null = null;
         if (mediaUrl) {
           try {
             const mediaRes = await fetch(mediaUrl, {
-              headers: { "User-Agent": "Mozilla/5.0 (compatible; TenkuBot/1.0)" },
-              signal: AbortSignal.timeout(20000),
+              headers: {
+                "User-Agent": "Mozilla/5.0 (compatible; TenkuBot/1.0)",
+                "Referer": "https://shoob.gg/",
+              },
+              signal: AbortSignal.timeout(25000),
             });
             if (mediaRes.ok) {
               const buf = Buffer.from(await mediaRes.arrayBuffer());
@@ -671,25 +774,28 @@ export async function handleStaff(ctx: CommandContext): Promise<void> {
               }
             }
           } catch (e: any) {
-            errors.push(`${cardName}: ${(e as any)?.message || "fetch failed"}`);
+            errors.push(`${displayName}: ${(e as any)?.message || "fetch failed"}`);
           }
+          // Small delay between downloads to avoid CDN rate-limiting
+          await new Promise(r => setTimeout(r, 150));
         }
 
-        const cardIsAnimated = isVideo ? 1 : (isAnimated ? 1 : 0);
-        // uploaded_by must be the plain phone number (source of truth), not the full JID
+        const cardIsAnimated = isVideo ? 1 : (ANIMATED_FETCH.has(cardTier) ? 1 : 0);
         const uploaderPhone = sender.split("@")[0].split(":")[0];
+        const newCardId = genCardId();
         db.prepare(
-          "INSERT INTO cards (name, series, tier, image_data, is_animated, uploaded_by, source) VALUES (?, ?, ?, ?, ?, ?, 'shoob.gg')"
-        ).run(cardName, cardSeries, tier, imageData, cardIsAnimated, uploaderPhone);
+          "INSERT INTO cards (id, name, series, tier, description, image_data, is_animated, uploaded_by, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'shoob.gg')"
+        ).run(newCardId, displayName, cardSeries, cardTier, cardDescription, imageData, cardIsAnimated, uploaderPhone);
         imported++;
       }
 
       let summary = `✅ *Shoob.gg Import Done!*\n\n` +
         `🎴 Imported: *${imported}* cards\n` +
-        `⏭️ Skipped (already exist): *${skipped}*\n` +
-        `📦 Series: *${series}* | Tier: *${tier}*`;
+        `⏭️ Skipped (duplicates): *${skipped}*\n` +
+        `📦 Series: *${series}* | Tier: *${tier}* | Page: *${page}*`;
       if (errors.length > 0) {
-        summary += `\n⚠️ Errors (${errors.length}): ${errors.slice(0, 3).join(", ")}`;
+        summary += `\n⚠️ Media fetch errors (${errors.length}): ${errors.slice(0, 3).join(", ")}`;
+        if (errors.length > 3) summary += ` … and ${errors.length - 3} more`;
       }
       await sendText(from, summary);
     } catch (err: any) {

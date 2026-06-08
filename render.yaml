@@ -6,7 +6,7 @@ services:
     plan: free
     buildCommand: pnpm install --frozen-lockfile=false && pnpm --filter @workspace/shadow-garden run build && node artifacts/api-server/build.mjs
     startCommand: node --enable-source-maps artifacts/api-server/dist/index.mjs
-    healthCheckPath: /healthz
+    healthCheckPath: /api/healthz
     envVars:
       - key: NODE_ENV
         value: production
@@ -21,6 +21,10 @@ services:
       - key: WEBSITE_URL
         sync: false
       - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: SHOOB_SESSION
         sync: false
       - key: JWT_SECRET
         sync: false
