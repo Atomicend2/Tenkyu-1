@@ -202,6 +202,7 @@ export async function handleMessage(
     || (lidFallbackPhone ? getStaff(lidFallbackPhone)?.role === "owner" : false);
 
   // Allow DMs only for core user commands (.reg, .p, .bal, etc.)
+  // Regular users messaging the bot in DMs outside these commands are ignored.
   if (!isGroup && !isOwner && !getStaff(sender)) {
     const allowedDmCmds = new Set(["register","reg","profile","p","balance","bal","daily","help","info","ping","alive","test","community","website","mem","comp"]);
     if (!isCommandBody) return;
@@ -291,15 +292,22 @@ export async function handleMessage(
     }
 
     // ── Echidna activation check ─────────────────────────────────────────────
-    // She responds to: @mentions, replies to bot, name mention, DMs, or when
-    // echidna_chat is enabled for the group.
+    // She responds to: @mentions (by JID or LID), replies to bot, name mention
+    // ("echidna"), DMs, or when echidna_chat is enabled for the group.
     if (body.trim().length > 0) {
       const botSock = sock as any;
       const botJid: string = botSock?.user?.id || "";
+      const botLid: string = botSock?.user?.lid || "";
       const contextInfo = getContextInfo(normalizedMsg.message as any);
       const quotedParticipant: string = contextInfo?.participant || "";
       const botPhone = botJid.split("@")[0].split(":")[0];
-      const isReplyToBot = !!(quotedParticipant && quotedParticipant.includes(botPhone));
+      const botLidNum = botLid.split("@")[0].split(":")[0];
+      // Normalise both sides before comparing so :0 device suffixes don't cause mismatches
+      const quotedPhone = quotedParticipant.split("@")[0].split(":")[0];
+      const isReplyToBot = !!(quotedPhone && (
+        quotedPhone === botPhone ||
+        (botLidNum && quotedPhone === botLidNum)
+      ));
       const groupRecord = isGroup ? getGroup(from) : null;
       const echidnaChatEnabled = groupRecord?.echidna_chat === "on";
 
@@ -308,18 +316,22 @@ export async function handleMessage(
         from,
         body,
         botJid,
+        botLid,
         isReplyToBot,
         echidnaChatEnabled,
         mentionedJids,
       });
 
       if (shouldReply) {
+        // Always quote the triggering message so Echidna replies directly to
+        // the user — whether she was @mentioned, named, replied to, or just
+        // chatting in an always-on group.
         handleEchidnaMessage(
           sock,
           from,
           sender,
           body,
-          isReplyToBot ? normalizedMsg : undefined,
+          normalizedMsg,
           msg.pushName || undefined
         ).catch((err) => logger.warn({ err }, "Echidna response failed"));
         return;
@@ -339,7 +351,7 @@ export async function handleMessage(
   const ctx: CommandContext = {
     sock: replySock, msg: normalizedMsg, from, sender, command, args, isAdmin, isBotAdmin,
     isOwner, isGroupAdmin, groupMeta, prefix: PREFIX, body: trimmedBody,
-    resolvedMentions, lidFallbackPhone,
+    resolvedMentions, lidFallbackPhone, senderRaw,
   };
 
   try {
@@ -544,13 +556,18 @@ async function dispatch(ctx: CommandContext): Promise<void> {
     }
 
     // ── .verify <code> ──────────────────────────────────────────────────────
-    // Step 2 of WhatsApp account linking. Validates the OTP and merges/creates
-    // the user record so both web and WhatsApp point to the same phone-keyed row.
+    // Step 2 of WhatsApp account linking.
+    // Validates OTP then runs a single TRANSACTION that:
+    //   4a. Writes the confirmed lid onto the canonical phone-keyed row
+    //   4b. Deletes any extra rows sharing the same phone (ghost dupes)
+    //   4c. Deletes any row that claimed the same lid under a different phone
+    // After the transaction exactly ONE row owns this phone, ONE owns this lid.
     case "verify": {
       const senderPhone = sender.split("@")[0].split(":")[0];
       const already = getUser(senderPhone);
-      if (already?.registered) {
-        await sendText(from, "✅ *Already registered!* Type *.p* to see your profile.");
+      // Short-circuit only when FULLY linked (both registered AND lid set)
+      if (already?.registered && already?.lid) {
+        await sendText(from, "✅ *Already linked!* Type *.p* to see your profile.");
         return;
       }
       const inputCode = ctx.args[0]?.trim();
@@ -575,77 +592,87 @@ async function dispatch(ctx: CommandContext): Promise<void> {
         await sendText(from, "❌ Wrong code. Check your WhatsApp and try again, or run *.link <phone>* for a new code.");
         return;
       }
-      // ✅ OTP verified — now link this WhatsApp sender to the canonical phone
-      db.prepare("DELETE FROM whatsapp_link_otps WHERE wa_sender = ?").run(senderPhone);
-      const phone = otpRow.phone as string;
-      const lidNum = senderRaw.endsWith("@lid") ? senderRaw.split("@")[0] : null;
 
-      // Before touching the LID column, resolve any ghost (unregistered) row that
-      // already owns this LID — otherwise the UNIQUE index on lid will throw.
-      if (lidNum) {
-        const lidConflict = db.prepare(
-          "SELECT id, registered, balance, xp, level FROM users WHERE lid = ? AND id != ?"
-        ).get(lidNum, phone) as any;
-        if (lidConflict) {
-          // Merge the conflicting row (registered or not) into the canonical phone row.
-          db.transaction(() => {
-            db.prepare(`UPDATE users SET
-              balance = balance + ?,
-              xp      = MAX(xp, ?),
-              level   = MAX(level, ?)
-            WHERE id = ?`).run(
-              lidConflict.balance || 0,
-              lidConflict.xp     || 0,
-              lidConflict.level  || 0,
-              phone,
-            );
-            for (const t of ["rpg_characters","inventory","user_cards","message_counts","card_deck","deck_backgrounds","guild_members","warnings","muted_users","summer_tokens","afk_users","lottery_entries"]) {
+      // ✅ OTP verified — consume it
+      db.prepare("DELETE FROM whatsapp_link_otps WHERE wa_sender = ?").run(senderPhone);
+      const phone = otpRow.phone as string; // canonical phone number — the master key
+
+      // Derive LID from ctx.senderRaw (the raw JID before LID→phone resolution)
+      const lidNum = ctx.senderRaw.endsWith("@lid") ? ctx.senderRaw.split("@")[0] : null;
+
+      const CHILD_TABLES = [
+        "rpg_characters", "inventory", "user_cards", "message_counts",
+        "card_deck", "deck_backgrounds", "guild_members", "warnings",
+        "muted_users", "summer_tokens", "afk_users", "lottery_entries",
+      ] as const;
+
+      // ── Single TRANSACTION: merge ghosts, link, dedup ─────────────────────
+      db.transaction(() => {
+        // ── 4c: kill any row that already owns THIS lid under a different phone
+        //       (prevents UNIQUE index collision when we write lid below)
+        if (lidNum) {
+          const lidConflict = db.prepare(
+            "SELECT id, balance, xp, level FROM users WHERE lid = ? AND id != ?"
+          ).get(lidNum, phone) as any;
+          if (lidConflict) {
+            db.prepare(
+              "UPDATE users SET balance = balance + ?, xp = MAX(xp,?), level = MAX(level,?) WHERE id = ?"
+            ).run(lidConflict.balance || 0, lidConflict.xp || 0, lidConflict.level || 0, phone);
+            for (const t of CHILD_TABLES) {
               try { db.prepare(`UPDATE OR IGNORE ${t} SET user_id = ? WHERE user_id = ?`).run(phone, lidConflict.id); } catch {}
             }
             db.prepare("DELETE FROM users WHERE id = ?").run(lidConflict.id);
-          })();
+          }
         }
-      }
 
-      // Find or create the phone-keyed user record
-      let userRow = db.prepare("SELECT * FROM users WHERE id = ? OR phone = ?").get(phone, phone) as any;
-      if (!userRow) {
-        // No web account yet — create one now (WhatsApp-first registration)
-        db.prepare(
-          "INSERT OR IGNORE INTO users (id, name, phone, whatsapp_id, lid, registered, registered_at, balance, created_at) VALUES (?, ?, ?, ?, ?, 1, ?, 45000, ?)"
-        ).run(phone, `Shadow_${phone.slice(-4)}`, phone, senderPhone, lidNum, nowSec, nowSec);
-        userRow = db.prepare("SELECT * FROM users WHERE id = ?").get(phone) as any;
-      } else if (userRow.id !== phone) {
-        // Account exists but was keyed by a different id (e.g. LID) — rename atomically
-        db.transaction(() => {
+        // ── Ensure the canonical phone-keyed row exists ───────────────────
+        const existing = db.prepare(
+          "SELECT * FROM users WHERE id = ? OR phone = ?"
+        ).get(phone, phone) as any;
+
+        if (!existing) {
+          // WhatsApp-first: no row at all — create it now
           db.prepare(
-            "UPDATE users SET id = ?, phone = ?, whatsapp_id = ?, lid = COALESCE(lid, ?), registered = 1, registered_at = COALESCE(NULLIF(registered_at,0), ?) WHERE id = ?"
-          ).run(phone, phone, senderPhone, lidNum, nowSec, userRow.id);
-          for (const t of ["rpg_characters","inventory","user_cards","message_counts","card_deck","deck_backgrounds","guild_members","warnings","muted_users","summer_tokens","afk_users","lottery_entries"]) {
-            try { db.prepare(`UPDATE OR IGNORE ${t} SET user_id = ? WHERE user_id = ?`).run(phone, userRow.id); } catch {}
+            "INSERT OR IGNORE INTO users " +
+            "(id, name, phone, whatsapp_id, lid, registered, registered_at, balance, created_at) " +
+            "VALUES (?, ?, ?, ?, ?, 1, ?, 45000, ?)"
+          ).run(phone, `Shadow_${phone.slice(-4)}`, phone, senderPhone, lidNum, nowSec, nowSec);
+        } else if (existing.id !== phone) {
+          // Row exists but was keyed by a different id (old LID or JID) — rename atomically
+          db.prepare(
+            "UPDATE users SET id=?, phone=?, whatsapp_id=?, lid=COALESCE(lid,?), " +
+            "registered=1, registered_at=COALESCE(NULLIF(registered_at,0),?) WHERE id=?"
+          ).run(phone, phone, senderPhone, lidNum, nowSec, existing.id);
+          for (const t of CHILD_TABLES) {
+            try { db.prepare(`UPDATE OR IGNORE ${t} SET user_id = ? WHERE user_id = ?`).run(phone, existing.id); } catch {}
           }
-        })();
-        userRow = db.prepare("SELECT * FROM users WHERE id = ?").get(phone) as any;
-      } else {
-        // Record already correctly keyed by phone — just update linking fields
-        db.prepare(
-          "UPDATE users SET whatsapp_id = ?, lid = COALESCE(lid, ?), registered = 1, registered_at = COALESCE(NULLIF(registered_at,0), ?), phone = ? WHERE id = ?"
-        ).run(senderPhone, lidNum, nowSec, phone, phone);
-        // Also migrate old ghost row keyed by senderPhone (if different from phone)
-        if (senderPhone !== phone) {
-          const ghostRow = db.prepare("SELECT * FROM users WHERE id = ?").get(senderPhone) as any;
-          if (ghostRow && !ghostRow.registered) {
-            db.transaction(() => {
-              // Migrate child records BEFORE deleting the ghost row
-              for (const t of ["rpg_characters","inventory","user_cards","message_counts","card_deck","deck_backgrounds","guild_members","warnings","muted_users","summer_tokens","afk_users","lottery_entries"]) {
-                try { db.prepare(`UPDATE OR IGNORE ${t} SET user_id = ? WHERE user_id = ?`).run(phone, senderPhone); } catch {}
-              }
-              db.prepare("DELETE FROM users WHERE id = ?").run(senderPhone);
-            })();
-          }
+        } else {
+          // Already correctly keyed by phone — just update linking fields
+          db.prepare(
+            "UPDATE users SET whatsapp_id=?, lid=COALESCE(lid,?), registered=1, " +
+            "registered_at=COALESCE(NULLIF(registered_at,0),?), phone=? WHERE id=?"
+          ).run(senderPhone, lidNum, nowSec, phone, phone);
         }
-        userRow = db.prepare("SELECT * FROM users WHERE id = ?").get(phone) as any;
-      }
+
+        // ── 4a: write the confirmed lid onto the canonical row ─────────────
+        if (lidNum) {
+          db.prepare("UPDATE users SET lid=? WHERE id=?").run(lidNum, phone);
+        }
+
+        // ── 4b: delete any other ghost rows sharing the same phone ─────────
+        db.prepare("DELETE FROM users WHERE phone=? AND id!=?").run(phone, phone);
+
+        // ── migrate / clean up a ghost row that was keyed by senderPhone ───
+        if (senderPhone !== phone) {
+          for (const t of CHILD_TABLES) {
+            try { db.prepare(`UPDATE OR IGNORE ${t} SET user_id = ? WHERE user_id = ?`).run(phone, senderPhone); } catch {}
+          }
+          db.prepare("DELETE FROM users WHERE id=?").run(senderPhone);
+        }
+      })();
+      // ─────────────────────────────────────────────────────────────────────
+
+      const userRow = db.prepare("SELECT * FROM users WHERE id=?").get(phone) as any;
       const displayName = userRow?.name && userRow.name !== phone ? userRow.name : `Shadow_${phone.slice(-4)}`;
       const balance = userRow?.balance || 45000;
       await sendText(
@@ -715,8 +742,10 @@ async function dispatch(ctx: CommandContext): Promise<void> {
       return handleAdmin(ctx);
 
     // ── .reg <phone> ─────────────────────────────────────────────────────────
-    // Per registration spec: if a phone number is provided, generate an OTP and
-    // send it to the CURRENT chat so the user can confirm with .verify <code>.
+    // Registration spec steps:
+    //   3a. User exists + lid set + registered → "already linked", STOP
+    //   3b. User exists but lid null OR not registered → send OTP (re-link allowed)
+    //    4. User does NOT exist → create ghost row anchored to phone, then send OTP
     // Without a phone arg, fall through to handleEconomy (shows instructions).
     case "reg":
     case "register": {
@@ -725,11 +754,29 @@ async function dispatch(ctx: CommandContext): Promise<void> {
         return handleEconomy(ctx);
       }
       const senderPhone2 = sender.split("@")[0].split(":")[0];
-      const alreadyReg = getUser(senderPhone2);
-      if (alreadyReg?.registered) {
-        await sendText(from, "✅ *Already registered!* Type *.p* to see your profile.");
+
+      // Derive incoming LID from the raw (un-resolved) sender JID
+      const incomingLidNum = ctx.senderRaw.endsWith("@lid") ? ctx.senderRaw.split("@")[0] : null;
+
+      const alreadyUser = getUser(senderPhone2);
+
+      // 3a: fully linked already — gate closed, no OTP
+      if (alreadyUser?.lid && alreadyUser?.registered) {
+        await sendText(from, "✅ *This number is already linked to WhatsApp.*\n\nType *.p* to view your profile.");
         return;
       }
+
+      // 4: brand new user — anchor the phone before OTP so no orphan rows form
+      if (!alreadyUser) {
+        const { getDb: getDbGhost } = await import("../db/database.js");
+        const dbGhost = getDbGhost();
+        const ghostNow = Math.floor(Date.now() / 1000);
+        dbGhost.prepare(
+          "INSERT OR IGNORE INTO users (id, phone, lid, registered, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?)"
+        ).run(rawPhone, rawPhone, incomingLidNum, ghostNow, ghostNow);
+      }
+
+      // 3b or 4 continued: generate OTP and send to sender's DM
       const regCode = String(Math.floor(100000 + Math.random() * 900000));
       const regExpiry = Math.floor(Date.now() / 1000) + 300;
       const { getDb: getDbReg } = await import("../db/database.js");
@@ -737,7 +784,6 @@ async function dispatch(ctx: CommandContext): Promise<void> {
       dbReg.prepare(
         "INSERT OR REPLACE INTO whatsapp_link_otps (wa_sender, phone, code, expires_at) VALUES (?, ?, ?, ?)"
       ).run(senderPhone2, rawPhone, regCode, regExpiry);
-      // Send OTP to sender's own DM (private chat with bot), not the current group.
       try {
         await ctx.sock.sendMessage(`${senderPhone2}@s.whatsapp.net`, {
           text:

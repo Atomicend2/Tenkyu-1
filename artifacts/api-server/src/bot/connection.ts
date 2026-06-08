@@ -16,7 +16,11 @@ import { logger } from "../lib/logger.js";
 import { handleMessage } from "./handlers/message.js";
 import { handleGroupUpdate, handleGroupParticipantsUpdate } from "./handlers/group.js";
 
-const DATA_DIR = path.join(process.cwd(), "data");
+// DATA_DIR env var lets you point auth + DB at a persistent mount (e.g. Render Disk at /data).
+// MUST match the DATA_DIR value in database.ts — both must point to the same persistent disk.
+const DATA_DIR = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.join(process.cwd(), "data");
 const AUTH_DIR = path.join(DATA_DIR, "auth");
 // Store pairing number outside AUTH_DIR so it survives a logout/wipe
 const PAIRING_PHONE_PATH = path.join(DATA_DIR, "paired-phone.txt");
